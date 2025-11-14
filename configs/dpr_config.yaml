@@ -1,0 +1,53 @@
+# G:\DPR-Net\configs\dpr_config.yaml
+# DPR-Net (V2)의 모든 하이퍼파라미터 및 설정
+
+# --- 1. 경로 설정 ---
+paths:
+  data_dir: "./data" 
+  checkpoint_dir: "./checkpoints"
+
+# --- 2. 학습 설정 ---
+train:
+  # (train.py에서 --epochs 인자)
+  epochs: 100
+  # (train.py에서 --batch_size 인자)
+  batch_size: 1
+  # (train.py에서 --patch_size 인자)
+  patch_size: 128
+  # (train.py에서 --learning_rate 인자)
+  learning_rate: 0.0001 # 1e-4
+  # (train.py에서 --save_every 인자)
+  save_every: 5
+
+# --- 3. V2 손실 함수 가중치 ---
+loss:
+  # (train.py에서 --lambda_film 인자)
+  lambda_film: 0.1
+  # (train.py에서 --lambda_consistency 인자)
+  lambda_consistency: 0.01
+
+# --- 4. 모델 아키텍처 설정 ---
+# (dpr_net.py의 DPR_Net.__init__ 인자들)
+model:
+  
+  # 4a. VETNet (Hands) 백본 설정
+  vetnet:
+    dim: 48
+    num_blocks: [4, 6, 6, 8]
+    refinement_blocks: 4
+    heads: [1, 2, 4, 8]
+    ffn_exp: 2.66
+    bias: false
+    ln_type: "WithBias"
+    volterra_rank: 4
+
+  # 4b. CLIP (Eyes) 설정
+  clip:
+    model_name: "ViT-L-14"
+    pretrained: "laion2b_s32b_b82k"
+    embed_dim: 1024 # ViT-L-14의 출력 차원
+
+  # 4c. LLM (Brain) 설정
+  llm:
+    model_name: "mistralai/Mistral-7B-v0.1"
+    embed_dim: 4096 # Mistral-7B의 hidden 차원

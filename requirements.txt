@@ -1,0 +1,9 @@
+# G:\DPR-Net\requirements.txt
+
+torch
+torchvision
+transformers
+open-clip-torch
+tqdm
+PyYAML
+Pillow

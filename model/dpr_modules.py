@@ -68,7 +68,7 @@ class DprClipEncoder(nn.Module):
         
         # 2. CLS 토큰 추가 + Positional Embedding
         # (B, 1, D)
-        cls_token = self.visual_encoder.class_embedding.expand(x.shape[0], -1, -1) 
+        cls_token = self.visual_encoder.class_embedding.unsqueeze(0).unsqueeze(0).expand(x.shape[0], 1, -1)
         x = torch.cat([cls_token, x], dim=1)  # (B, N_patches + 1, D)
         x = x + self.visual_encoder.positional_embedding
         
@@ -119,9 +119,12 @@ class DprLLM(nn.Module):
         print(f"Loading LLM (Brain): {model_name}...")
         
         try:
-            # 1. LLM (Mistral) 로드
-            self.llm = MistralForCausalLM.from_pretrained(model_name)
-            
+        #   1. LLM (Mistral) 로드 (8-bit 양자화 적용)
+            self.llm = MistralForCausalLM.from_pretrained(
+            model_name,
+            load_in_8bit=True,
+            device_map="auto" # GPU에 자동으로 배포
+        )
             # (참고) 텍스트 생성 및 L_consistency를 위한 토크나이저
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             if self.tokenizer.pad_token is None:
@@ -169,14 +172,14 @@ class DprLLM(nn.Module):
         # 시각 임베딩을 텍스트 임베딩처럼 LLM에 입력
         outputs = self.llm(
             inputs_embeds=llm_embeds,
-            output_hidden_states=False, # last_hidden_state가 기본 출력임
+            output_hidden_states=True, # last_hidden_state가 기본 출력임
             return_dict=True
         )
         
         # 3. 출력 추출
         # Control Path용: 마지막 레이어의 모든 토큰 hidden state
-        hidden_state = outputs.last_hidden_state # (B, N+1, D_llm)
-        
+        # hidden_state = outputs.last_hidden_state # (B, N+1, D_llm)
+        hidden_state = outputs.hidden_states[-1] # <--- 튜플의 마지막 항목을 가져옴
         # Text Path용: 텍스트 생성을 위한 logits
         logits = outputs.logits # (B, N+1, Vocab_Size)
         
