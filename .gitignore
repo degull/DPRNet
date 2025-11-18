@@ -2,3 +2,5 @@
 checkpoints/
 data/
 results/
+checkpoints_lora/
+checkpoints_lora_en/

@@ -4,8 +4,10 @@
 # --- 1. 경로 설정 ---
 paths:
   data_dir: "./data" 
-  checkpoint_dir: "./checkpoints"
-
+  checkpoint_dir: "./checkpoints_lora_en"
+  #checkpoint_dir: "./checkpoints_lora"
+  # resume_checkpoint: "./checkpoints/epoch_1_total_0_2610_img_0_1500_text_0_1000_cons_0_0110.pth"
+  
 # --- 2. 학습 설정 ---
 train:
   # (train.py에서 --epochs 인자)
@@ -15,7 +17,7 @@ train:
   # (train.py에서 --patch_size 인자)
   patch_size: 128
   # (train.py에서 --learning_rate 인자)
-  learning_rate: 0.0001 # 1e-4
+  learning_rate: 0.00001 # 1e-4
   # (train.py에서 --save_every 인자)
   save_every: 5
 
