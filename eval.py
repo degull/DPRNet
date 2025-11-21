@@ -136,10 +136,10 @@ if __name__ == "__main__":
     CONFIG_PATH = "configs/dpr_config.yaml"
     
     # [수정] 4 에포크 체크포인트로 변경
-    CHECKPOINT_PATH = r"G:\DPR-Net\checkpoints_lora\epoch_4_total_0_1025_img_0_0899_text_0_0125_cons_0_0003.pth" 
+    CHECKPOINT_PATH = r"G:\DPR-Net\checkpoints_lora_en_2\epoch_9_total_0_0903_img_0_0823_text_0_0081_cons_0_0001.pth"
     
     # (테스트할 왜곡 이미지 1개 경로 - 예: Rain100H 테스트셋)
-    TEST_IMAGE_PATH = r"G:\DPR-Net\data\rain100H\test\rain\norain-1.png"
+    TEST_IMAGE_PATH = r"G:\DPR-Net\data\SOTS\indoor\hazy\1403_5.png"
     # --- (설정 끝) ---
 
     # (경로에 폴더명이 checkpoints_lora가 맞는지 확인하세요)

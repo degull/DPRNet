@@ -4,10 +4,11 @@
 # --- 1. 경로 설정 ---
 paths:
   data_dir: "./data" 
-  checkpoint_dir: "./checkpoints_lora_en"
-  #checkpoint_dir: "./checkpoints_lora"
-  # resume_checkpoint: "./checkpoints/epoch_1_total_0_2610_img_0_1500_text_0_1000_cons_0_0110.pth"
+  checkpoint_dir: "./checkpoints_lora_en_2"
   
+  # [수정] 이어서 학습할 체크포인트 경로 (Windows 경로 역슬래시 \ 대신 / 사용 권장)
+  #resume_checkpoint: "G:/DPR-Net/checkpoints_lora_en/epoch_3_total_0_1085_img_0_0963_text_0_0121_cons_0_0013.pth"
+
 # --- 2. 학습 설정 ---
 train:
   # (train.py에서 --epochs 인자)

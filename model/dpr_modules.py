@@ -1,7 +1,7 @@
+# G:\DPR-Net\model\dpr_modules.py
 import torch
 import torch.nn as nn
 import open_clip # 'open-clip-torch'
-# [수정] peft 및 BitsAndBytesConfig 임포트
 from transformers import AutoTokenizer, MistralForCausalLM, MistralConfig, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model # 'peft' 라이브러리 필요
 
@@ -189,7 +189,7 @@ class DprLLM(nn.Module):
             # 3. 텍스트 생성
             generated_ids = self.llm.generate(
                 inputs_embeds=inputs_embeds,
-                max_new_tokens=40, # (생성할 최대 텍스트 길이)
+                max_new_tokens=200, # (생성할 최대 텍스트 길이)
                 num_beams=2,
                 early_stopping=True,
                 pad_token_id=self.tokenizer.eos_token_id
