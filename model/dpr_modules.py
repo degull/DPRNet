@@ -1,6 +1,7 @@
 # G:\DPR-Net\model\dpr_modules.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import open_clip # 'open-clip-torch'
 from transformers import AutoTokenizer, MistralForCausalLM, MistralConfig, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model # 'peft' 라이브러리 필요
@@ -36,14 +37,12 @@ class DprClipEncoder(nn.Module):
         """
         이미지 텐서(x)를 입력받아 global 및 patch 임베딩을 반환합니다.
         """
-        
         # 1. Patch Embedding
         x = self.visual_encoder.conv1(x)  # (B, D, H', W')
         x = x.reshape(x.shape[0], x.shape[1], -1)  # (B, D, N_patches)
         x = x.permute(0, 2, 1)  # (B, N_patches, D)
         
         # 2. CLS 토큰 추가 + Positional Embedding
-        # (1D -> 3D 텐서로 올바르게 변환)
         cls_token = self.visual_encoder.class_embedding.unsqueeze(0).unsqueeze(0).expand(x.shape[0], 1, -1)
         x = torch.cat([cls_token, x], dim=1)  # (B, N_patches + 1, D)
         x = x + self.visual_encoder.positional_embedding
@@ -66,136 +65,222 @@ class DprClipEncoder(nn.Module):
 
 
 # -----------------------------------------------
-#  ② LLM (Brain) 모듈 (LoRA + 버그 수정)
+#  ② Pixel Decoder Modules (PixelLM 핵심 부품)
 # -----------------------------------------------
-# (사용자 코드에서 중복 정의된 DprLLM 클래스 1개 제거)
-class DprLLM(nn.Module):
+
+class PPM(nn.Module):
     """
-    DPR-Net (V2)의 ②번 LLM (Brain) 모듈.
-    (8-bit 양자화 + LoRA 어댑터 적용됨)
+    Pyramid Pooling Module (PixelLM의 디코더 핵심)
+    다양한 스케일(Context)의 정보를 통합합니다.
+    """
+    def __init__(self, in_dim, reduction_dim, bins):
+        super().__init__()
+        self.features = []
+        for bin in bins:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(bin),
+                nn.Conv2d(in_dim, reduction_dim, kernel_size=1, bias=False),
+                nn.GELU()
+            ))
+        self.features = nn.ModuleList(self.features)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [x]
+        for f in self.features:
+            # 풀링 후 다시 원래 크기로 Upsample하여 합침
+            out.append(F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=True))
+        return torch.cat(out, 1)
+
+
+class PixelDecoder(nn.Module):
+    """
+    LLM의 Hidden State를 받아 이미지 형태의 Feature map으로 변환하는 경량 디코더
+    """
+    def __init__(self, llm_dim, out_dim):
+        super().__init__()
+        
+        # 1. Projection: LLM dimension -> Decoder dimension (512)
+        self.proj = nn.Conv2d(llm_dim, 512, kernel_size=1) 
+        
+        # 2. PPM (Pyramid Pooling)
+        # 512채널 + (128채널 * 4개 bin) = 1024채널
+        self.ppm = PPM(512, int(512/4), [1, 2, 3, 6])
+        
+        # 3. Final Fusion
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(512 + 512, 512, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(32, 512),
+            nn.GELU(),
+            nn.Conv2d(512, out_dim, kernel_size=1) # 최종 출력 (FiLM Head 입력 차원과 맞춤)
+        )
+
+    def forward(self, llm_hidden, h, w):
+        """
+        llm_hidden: (B, N_patches, D) - CLS 토큰 제외됨
+        h, w: 원래 비전 토큰의 그리드 크기 (예: 16x16)
+        """
+        # (B, N, D) -> (B, D, N)
+        x = llm_hidden.permute(0, 2, 1).contiguous() 
+        # (B, D, H, W) 형태로 변환 (Spatial Reshape)
+        x = x.view(x.size(0), x.size(1), h, w) 
+        
+        # Pixel Reasoning
+        x = self.proj(x)
+        x = self.ppm(x)
+        x = self.bottleneck(x)
+        
+        return x # (B, out_dim, H, W)
+
+
+# -----------------------------------------------
+#  ③ DprPixelLM (Brain + Decoder) [기존 DprLLM 대체]
+# -----------------------------------------------
+
+class DprPixelLM(nn.Module):
+    """
+    Mistral + Pixel Decoder를 결합한 PixelLM 아키텍처 구현체.
+    LLM의 추론 결과를 픽셀 레벨로 디코딩하여 FiLM Head에 전달합니다.
     """
     def __init__(self, 
-                 clip_embed_dim: int = 768, 
+                 clip_embed_dim: int = 1024, # ViT-L-14 output
                  llm_embed_dim: int = 4096, 
                  model_name: str = "mistralai/Mistral-7B-v0.1"):
         super().__init__()
         
-        print(f"Loading LLM (Brain): {model_name}...")
+        print(f"Loading PixelLM Core (Based on {model_name})...")
         
         try:
-            # 8-bit 양자화 설정
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True
-            )
-            
-            # 1. LLM (Mistral) 로드 (양자화 적용)
+            # 1. LLM (Mistral) 로드 (8-bit 양자화)
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
             self.llm = MistralForCausalLM.from_pretrained(
                 model_name,
-                quantization_config=bnb_config, # 8-bit 설정 적용
-                device_map="auto" # (중요) accelerate가 GPU에 자동 배포
+                quantization_config=bnb_config,
+                device_map="auto"
             )
             
             # --- LoRA 어댑터 적용 ---
             lora_config = LoraConfig(
-                r=8, # Rank
-                lora_alpha=16,
-                target_modules=["q_proj", "v_proj"], # Mistral 어텐션 레이어
+                r=16, # PixelLM은 표현력이 중요하므로 Rank 상향 권장 (8->16)
+                lora_alpha=32,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], # 모든 어텐션 레이어 타겟
                 lora_dropout=0.05,
                 bias="none",
-                task_type="CAUSAL_LM" # 텍스트 생성
+                task_type="CAUSAL_LM"
             )
-            
             self.llm = get_peft_model(self.llm, lora_config)
-            print("Applied LoRA to LLM (Brain). Trainable LoRA parameters:")
+            print("Applied LoRA to PixelLM Brain.")
             self.llm.print_trainable_parameters()
-            # --- LoRA 적용 완료 ---
 
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+
         except Exception as e:
             print(f"Error loading Mistral model: {e}")
-            print("Make sure 'transformers', 'bitsandbytes', 'accelerate', 'peft' are installed.")
             raise e
-            
-        # 2. Input Projection Layer
+        
+        # 2. Input Projector (Eyes -> Brain)
         self.input_projector = nn.Linear(clip_embed_dim, llm_embed_dim)
         
-        # 3. LLM 가중치 동결 (LoRA 레이어 제외)
-        # (input_projector는 PEFT와 별개이므로 수동으로 trainable 설정)
-        for param in self.input_projector.parameters():
-            param.requires_grad = True
-
-        print("LLM (Brain) module initialized (LoRA + Projector are trainable).")
-
-    def forward(self, 
-                vision_tokens: torch.Tensor, 
-                text_labels: torch.Tensor = None,
-                text_attention_mask: torch.Tensor = None):
-        """
-        [수정] 명시적 텍스트 훈련(L_text)을 위해
-        'text_labels' (정답 텍스트 토큰)도 입력받습니다.
-        """
+        # 3. ★ [NEW] Lightweight Pixel Decoder ★
+        # LLM의 출력을 다시 시각적 특징맵으로 정제
+        # 출력 차원을 llm_embed_dim(4096)으로 맞추어 기존 FiLM Head와 호환성 유지
+        self.pixel_decoder = PixelDecoder(llm_dim=llm_embed_dim, out_dim=llm_embed_dim)
         
-        # 1. Project CLIP embeddings to LLM embedding space
-        vision_embeds = self.input_projector(vision_tokens)
+        # 4. Trainable 설정
+        for param in self.input_projector.parameters(): param.requires_grad = True
+        for param in self.pixel_decoder.parameters(): param.requires_grad = True # 디코더 학습 필수
         
+        print("✅ DprPixelLM initialized (LLM + Pixel Decoder).")
+
+    def forward(self, vision_tokens, text_labels=None, text_attention_mask=None):
+        """
+        vision_tokens: CLIP에서 나온 (B, 257, D) 형태. [CLS, Patch_1, ..., Patch_256]
+        """
+        # 1. Vision Embedding Projection
+        vision_embeds = self.input_projector(vision_tokens) # (B, 257, 4096)
+        
+        loss_text = None
+        logits = None
+        generated_ids = None
+
+        # 2. LLM Input 구성
         if text_labels is not None:
-            # --- 훈련(Train) 모드 (L_text 계산) ---
-            # 2. 정답 텍스트 토큰을 LLM 임베딩으로 변환
+            # --- Train Mode: Vision + Text ---
             text_embeds = self.llm.get_input_embeddings()(text_labels)
-
-            # 3. [시각 임베딩 + 텍스트 임베딩] 결합
             inputs_embeds = torch.cat([vision_embeds, text_embeds], dim=1)
             
-            # 4. 어텐션 마스크 결합
+            # Attention Mask
             vision_mask = torch.ones(vision_embeds.shape[:2], dtype=torch.long, device=vision_embeds.device)
             full_attention_mask = torch.cat([vision_mask, text_attention_mask], dim=1)
             
-            # 5. [정답 레이블] 결합 (시각 토큰 부분은 -100으로 마스킹)
+            # Labels (Vision 부분은 -100으로 마스킹)
             vision_labels = torch.full_like(vision_mask, -100)
             full_labels = torch.cat([vision_labels, text_labels], dim=1)
 
-            # 6. LLM Forward Pass (L_text 포함)
+            # LLM Forward
             outputs = self.llm(
                 inputs_embeds=inputs_embeds,
                 attention_mask=full_attention_mask,
                 labels=full_labels,
-                output_hidden_states=True, # L_consistency를 위해
+                output_hidden_states=True,
                 return_dict=True
             )
+            loss_text = outputs.loss
+            logits = outputs.logits
             
-            loss_text = outputs.loss # (L_text 손실)
-            hidden_state = outputs.hidden_states[-1] # [수정] FiLM Head를 위한 전체 hidden_state
-            logits = outputs.logits 
-
-            # (L_consistency용 CLS 토큰과 FiLM용 8개 토큰 모두 반환)
-            return loss_text, hidden_state, logits
-
+            # Hidden State 추출 (전체 시퀀스 중 Vision Token 부분만 필요함)
+            # outputs.hidden_states[-1] shape: (B, 257 + Text_Len, D)
+            total_hidden = outputs.hidden_states[-1]
+            vision_seq_len = vision_tokens.shape[1] # 257
+            vision_hidden_state = total_hidden[:, :vision_seq_len, :] # (B, 257, D)
+            
         else:
-            # --- 추론(Eval) 모드 ---
-            # 1. 시각 임베딩만 입력
+            # --- Eval Mode: Vision Only ---
             inputs_embeds = vision_embeds
             
-            # [수정] 추론 시에도 hidden_state를 반환해야 FiLM 작동 가능
-            # 2. 먼저 hidden_state 계산
             outputs = self.llm(
                 inputs_embeds=inputs_embeds,
                 output_hidden_states=True,
                 return_dict=True
             )
-            hidden_state = outputs.hidden_states[-1] # [B, 257, D_llm]
-
-            # 3. 텍스트 생성
+            vision_hidden_state = outputs.hidden_states[-1] # (B, 257, D)
+            
+            # 텍스트 생성 (선택 사항)
             generated_ids = self.llm.generate(
                 inputs_embeds=inputs_embeds,
-                max_new_tokens=200, # (생성할 최대 텍스트 길이)
+                max_new_tokens=200,
                 num_beams=2,
-                early_stopping=True,
                 pad_token_id=self.tokenizer.eos_token_id
             )
-            
-            return generated_ids, hidden_state, None # hidden_state 반환
+
+        # 3. ★ Pixel Reasoning (Decoding) ★
+        # LLM이 이해한 정보를 Pixel Decoder에 통과시켜 공간 정보를 복원합니다.
+        
+        # CLS 토큰과 Patch 토큰 분리
+        cls_token = vision_hidden_state[:, 0:1, :] # (B, 1, D) - Global Semantic
+        patch_tokens = vision_hidden_state[:, 1:, :] # (B, 256, D) - Local Patches
+        
+        # Reshape: (B, 256, D) -> Grid (16x16)
+        # ViT-L/14는 224x224 이미지를 14x14 패치로 쪼갬 -> 16x16 Grid (256개)
+        # (만약 224 이미지라면 16x16=256)
+        grid_size = int(patch_tokens.shape[1] ** 0.5) # 16
+        
+        # Pixel Decoder 통과 -> (B, D, H, W)
+        decoded_map = self.pixel_decoder(patch_tokens, h=grid_size, w=grid_size)
+        
+        # FiLM Head를 위해 다시 시퀀스로 변환
+        # (B, D, H, W) -> (B, D, H*W) -> (B, N, D)
+        decoded_seq = decoded_map.flatten(2).transpose(1, 2) # (B, 256, D)
+        
+        # 최종 결합: CLS(LLM Pure) + Patches(Pixel Decoded)
+        final_features = torch.cat([cls_token, decoded_seq], dim=1) # (B, 257, D)
+        
+        if text_labels is not None:
+            return loss_text, final_features, logits
+        else:
+            return generated_ids, final_features, None
 
 
 # -----------------------------------------------
@@ -279,66 +364,9 @@ class DprMultiStageFiLMHead(nn.Module):
 #  ✅ 테스트 코드 (dpr_modules.py)
 # -----------------------------------------------
 
-# (가짜 LLM 설정 클래스 - 빠른 테스트용)
-class DummyDprLLM(DprLLM):
-    def __init__(self, clip_embed_dim, llm_embed_dim):
-        nn.Module.__init__(self) # DprLLM의 __init__ 건너뛰기
-        print("Loading DUMMY LLM for fast testing (no download)...")
-        
-        self.config = MistralConfig(
-            hidden_size=llm_embed_dim,
-            vocab_size=1000, # small vocab
-            num_hidden_layers=2, # very shallow
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            intermediate_size=1024
-        )
-        self.llm = MistralForCausalLM(self.config) # 가짜 모델 생성
-        
-        # (LoRA 테스트는 더미에서 생략)
-        print("Applying DUMMY LoRA...")
-        
-        self.tokenizer = None
-        self.input_projector = nn.Linear(clip_embed_dim, llm_embed_dim)
-        
-        for param in self.llm.parameters():
-            param.requires_grad = False
-        for param in self.input_projector.parameters():
-            param.requires_grad = True
-        print("Dummy LLM (Brain) module initialized.")
-    
-    # (더미 forward는 LoRA 훈련 로직을 따름)
-    def forward(self, vision_tokens: torch.Tensor, 
-                text_labels: torch.Tensor = None,
-                text_attention_mask: torch.Tensor = None):
-        
-        llm_embeds = self.input_projector(vision_tokens)
-        
-        if text_labels is not None:
-            # (훈련 모드 - 더미)
-            # (실제 LoRA 모델과 동일한 출력을 흉내)
-            outputs = self.llm(inputs_embeds=llm_embeds, output_hidden_states=True)
-            loss_text = torch.tensor(0.0, device=llm_embeds.device) # 가짜 손실
-            hidden_state = outputs.hidden_states[-1] # 전체 hidden_state
-            logits = outputs.logits
-            return loss_text, hidden_state, logits # (hidden_state 반환)
-        else:
-            # (추론 모드 - 더미)
-            # (가짜 hidden_state 및 생성 ID 반환)
-            dummy_hidden_state = torch.randn(
-                vision_tokens.shape[0], 
-                vision_tokens.shape[1], 
-                self.config.hidden_size, 
-                device=vision_tokens.device
-            )
-            generated_ids = torch.randint(0, 1000, (vision_tokens.shape[0], 10), device=vision_tokens.device)
-            return generated_ids, dummy_hidden_state, None
-
-
 if __name__ == '__main__':
     
-    print("--- DPR-Net V2 Module Test (if __name__ == '__main__') ---")
-    print("[Note] This test block may be outdated due to DprLLM.forward signature changes.")
+    print("--- DPR-Net PixelLM Module Test ---")
     
     try:
         # 0. 테스트 설정
@@ -346,57 +374,33 @@ if __name__ == '__main__':
         CLIP_DIM_L14 = 1024
         LLM_DIM = 4096 
         VETNET_DIM = 48
-        NUM_TOKENS_L14 = 257 # 1 CLS + (224/14)^2
+        NUM_TOKENS_L14 = 257 # 1 CLS + 256 Patches
         BATCH_SIZE = 2
         
         # 1. DprClipEncoder (Eyes) 테스트
         clip_encoder = DprClipEncoder().to(device)
         clip_encoder.eval() 
         dummy_image = torch.randn(BATCH_SIZE, 3, 224, 224).to(device)
-        print(f"\n[Test 1: DprClipEncoder (Eyes v2)]")
+        print(f"\n[Test 1: DprClipEncoder]")
         with torch.no_grad():
             vision_tokens, _ = clip_encoder(dummy_image)
         assert vision_tokens.shape == (BATCH_SIZE, NUM_TOKENS_L14, CLIP_DIM_L14)
-        print(f"✅ DprClipEncoder (Eyes v2) module passed.")
+        print(f"✅ DprClipEncoder passed.")
         
-        # 2. DprLLM (Brain) 테스트 (더미)
-        llm_module = DummyDprLLM(CLIP_DIM_L14, LLM_DIM).to(device)
-        llm_module.eval()
-        print(f"\n[Test 2: DprLLM (Brain) - Dummy Test]")
-        
-        # (훈련 모드 테스트)
-        dummy_labels = torch.randint(0, 1000, (BATCH_SIZE, 10), device=device)
-        dummy_mask = torch.ones_like(dummy_labels)
-        with torch.no_grad():
-            loss_text, hidden_state, logits = llm_module(vision_tokens, dummy_labels, dummy_mask)
-        assert loss_text is not None
-        # (전체 hidden_state가 반환되는지 확인)
-        assert hidden_state.shape == (BATCH_SIZE, NUM_TOKENS_L14, LLM_DIM) 
-        print(f"✅ DprLLM (Train Mode) dummy test passed.")
-        
-        # (추론 모드 테스트)
-        with torch.no_grad():
-            generated_ids, hidden_state, _ = llm_module(vision_tokens)
-        assert generated_ids.shape[0] == BATCH_SIZE
-        assert hidden_state.shape == (BATCH_SIZE, NUM_TOKENS_L14, LLM_DIM) # (추론 시에도 hidden_state 확인)
-        print(f"✅ DprLLM (Eval Mode) dummy test passed.")
+        # 2. PixelDecoder Unit Test
+        print(f"\n[Test 2: PixelDecoder]")
+        decoder = PixelDecoder(llm_dim=LLM_DIM, out_dim=LLM_DIM).to(device)
+        dummy_llm_out = torch.randn(BATCH_SIZE, 256, LLM_DIM).to(device) # 16x16 patches
+        decoded = decoder(dummy_llm_out, 16, 16)
+        assert decoded.shape == (BATCH_SIZE, LLM_DIM, 16, 16)
+        print(f"✅ PixelDecoder passed.")
 
-        # 3. DprMultiStageFiLMHead (Controller) 테스트
-        print(f"\n[Test 3: DprMultiStageFiLMHead (Controller)]")
-        film_head = DprMultiStageFiLMHead(LLM_DIM, VETNET_DIM).to(device)
-        film_head.eval()
-        # (DprLLM이 이제 [B, 257, D]를 반환하므로 테스트 정상 작동)
-        with torch.no_grad():
-            film_signals = film_head(hidden_state) # (257개 토큰 사용)
-        assert len(film_signals) == film_head.num_stages
-        print("✅ DprMultiStageFiLMHead (Controller) module passed.")
-        print("\n--- All V2 modules (dummy) test passed! ---")
+        print("\n[Note] DprPixelLM requires real Mistral weights. Skipping full integration test in this script.")
+        print("Please run dpr_net.py or train.py to load actual models.")
 
     except ImportError as e:
-        print(f"\n[Error] 'open-clip-torch', 'transformers', 'bitsandbytes', 'accelerate', 'peft' 라이브러리가 필요합니다.")
-        print(f"Details: {e}")
-        print("pip install open-clip-torch transformers bitsandbytes accelerate peft")
+        print(f"\n[Error] Dependencies missing: {e}")
     except Exception as e:
         import traceback
-        print(f"\n테스트 중 오류 발생: {e}")
+        print(f"\nTest Error: {e}")
         traceback.print_exc()

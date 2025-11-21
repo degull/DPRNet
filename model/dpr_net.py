@@ -1,12 +1,14 @@
-# G:\DPR-Net\model\dpr_modules.py
+
+# G:\DPR-Net\model\dpr_net.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T 
 
 # --- 1. 모듈 임포트 ---
+# [수정] DprLLM 대신 DprPixelLM을 가져옵니다.
 from .restormer_volterra import RestormerVolterra
-from .dpr_modules import DprClipEncoder, DprLLM, DprMultiStageFiLMHead
+from .dpr_modules import DprClipEncoder, DprPixelLM, DprMultiStageFiLMHead
 
 # -----------------------------------------------
 #  ⑤ FiLM이 주입되는 VETNet (Hands)
@@ -45,7 +47,7 @@ class FiLMedVETNet(RestormerVolterra):
         return out
 
 # -----------------------------------------------
-#  🚀 DPR-Net (V2) 최종 조립 모델 (LoRA 버전)
+#  🚀 DPR-Net (V2) Final Assembly [PixelLM Powered]
 # -----------------------------------------------
 class DPR_Net(nn.Module):
     def __init__(self, 
@@ -60,10 +62,10 @@ class DPR_Net(nn.Module):
                 ):
         super().__init__()
         
-        print("Initializing DPR-Net (V2) [LoRA Enabled]...")
+        print("Initializing DPR-Net (V2) [PixelLM Powered]...")
         
         # --- 1. Eyes (CLIP) ---
-        print("  (1/4) Loading Eyes (CLIP)...")
+        print(" (1/4) Loading Eyes (CLIP)...")
         self.clip_encoder = DprClipEncoder(
             model_name=clip_model_name, pretrained=clip_pretrained
         )
@@ -71,9 +73,10 @@ class DPR_Net(nn.Module):
         clip_std = (0.26862954, 0.26130258, 0.27577711)
         self.clip_normalize = T.Normalize(mean=clip_mean, std=clip_std)
         
-        # --- 2. Brain (LLM) ---
-        print("  (2/4) Loading Brain (LLM) with LoRA...")
-        self.llm_module = DprLLM(
+        # --- 2. Brain (PixelLM) ---
+        # [수정] DprPixelLM으로 교체
+        print(" (2/4) Loading Brain (PixelLM with Decoder)...")
+        self.llm_module = DprPixelLM(
             clip_embed_dim=clip_embed_dim,
             llm_embed_dim=llm_embed_dim,
             model_name=llm_model_name
@@ -81,14 +84,14 @@ class DPR_Net(nn.Module):
         self.tokenizer = self.llm_module.tokenizer
 
         # --- 3. Controller (FiLM Head) ---
-        print("  (3/4) Loading Controller (FiLM Head)...")
+        print(" (3/4) Loading Controller (FiLM Head)...")
         self.film_head = DprMultiStageFiLMHead(
             llm_embed_dim=llm_embed_dim,
             vetnet_dim=vetnet_dim
         )
         
         # --- 4. Hands (FiLM-Controlled VETNet) ---
-        print("  (4/4) Loading Hands (FiLMed VETNet Backbone)...")
+        print(" (4/4) Loading Hands (FiLMed VETNet Backbone)...")
         self.vet_backbone = FiLMedVETNet(
             dim=vetnet_dim, num_blocks=vetnet_num_blocks,
             num_refinement_blocks=vetnet_refinement_blocks,
@@ -97,7 +100,7 @@ class DPR_Net(nn.Module):
             volterra_rank=vetnet_volterra_rank
         )
         
-        print("\n✅ DPR-Net (V2) [LoRA Enabled] successfully initialized.")
+        print("\n✅ DPR-Net (V2) [PixelLM Powered] successfully initialized.")
 
     def forward(self, img_distorted, 
                 text_labels=None, 
@@ -112,7 +115,8 @@ class DPR_Net(nn.Module):
         vision_tokens, _ = self.clip_encoder(img_clip_norm)
         
         if mode == 'train':
-            # 3. 훈련 모드
+            # 3. 훈련 모드 (PixelLM Forward)
+            # 반환값: loss_text, pixel_decoded_features, logits
             loss_text, hidden_state, logits = self.llm_module(
                 vision_tokens, 
                 text_labels=text_labels, 
@@ -120,7 +124,11 @@ class DPR_Net(nn.Module):
             )
             
             # 4. FiLM 신호 생성
+            # hidden_state는 이미 Pixel Decoder를 통과하여 (B, 257, D) 형태입니다.
+            # Vision 부분(Decoder 통과됨)만 잘라낼 필요 없이 그대로 사용하면 되지만,
+            # 기존 코드 로직에 따라 Vision Tokens 길이만큼 슬라이싱 (257개)
             vision_hidden_state = hidden_state[:, :vision_tokens.shape[1], :]
+            
             film_signals = self.film_head(vision_hidden_state) 
             cls_hidden_state = vision_hidden_state[:, 0:1, :] 
             
@@ -140,6 +148,7 @@ class DPR_Net(nn.Module):
             generated_ids, hidden_state, _ = self.llm_module(vision_tokens) 
             
             # 4. FiLM 신호 생성
+            # Pixel Decoder를 통과한 Feature를 사용
             film_signals = self.film_head(hidden_state[:, :vision_tokens.shape[1], :]) 
             
             # 5. VETNet 실행
@@ -149,12 +158,14 @@ class DPR_Net(nn.Module):
             return {
                 'img_restored': img_restored,
                 'generated_ids': generated_ids,
-                'film_signals': film_signals  # <-- [수정] Control Path 확인을 위해 이 줄 추가
+                'film_signals': film_signals 
             }
 
 
-# --- (테스트 코드는 dpr_net.py에서 제거하거나 수정해야 함) ---
 if __name__ == '__main__':
-    print("[Note] dpr_net.py main test block is disabled (needs update for LoRA).")
-    print("Please run train.py or eval.py")
-    pass
+    # 간단한 의존성 및 초기화 테스트
+    try:
+        model = DPR_Net()
+        print("DPR_Net instantiation successful.")
+    except Exception as e:
+        print(f"Initialization check failed (expected if no GPU/Weights): {e}")
