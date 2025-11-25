@@ -1,62 +1,76 @@
-import torch
-import yaml
 import os
-from PIL import Image
-import torchvision.transforms as T
-from torch.cuda.amp import autocast
+import yaml
+import torch
+import cv2
+import numpy as np
+import time
+from PIL import Image # 이미지 로드용 추가
+from torch.utils.data import DataLoader, Dataset
 
-# --- 1. 모델 및 모듈 임포트 ---
+# --- 사용자 모듈 임포트 ---
 try:
     from model.dpr_net import DPR_Net
 except ImportError as e:
-    print(f"Error: {e}")
-    print("G:\\DPR-Net\\model\\__init__.py 파일이 있는지 확인하세요.")
-    exit()
+    print(f"Error: 패키지 로드 실패 ({e}).")
+    exit(1)
 
-# --- 2. 헬퍼 함수 ---
-def load_and_prep_image(path, device):
-    """
-    테스트용 이미지 1장을 로드하고 0~1 범위 텐서로 변환합니다.
-    """
-    try:
-        image = Image.open(path).convert("RGB")
-        transform = T.ToTensor()
-        tensor = transform(image).unsqueeze(0) # (1, 3, H, W)
-        return tensor.to(device)
-    except FileNotFoundError:
-        print(f"\n[Error] 이미지를 찾을 수 없습니다: {path}")
-        return None
-    except Exception as e:
-        print(f"\n[Error] 이미지 로드 중 오류: {e}")
-        return None
+# ----------------------------------------------------------
+# 1. 사용자 지정 커스텀 데이터셋 클래스 (파일 리스트용)
+# ----------------------------------------------------------
+class CustomFileDataset(Dataset):
+    def __init__(self, file_list):
+        self.file_list = file_list
 
-def decode_llm_explanation(generated_ids, tokenizer):
-    """
-    [수정] LLM이 생성한 'generated_ids'를 텍스트로 디코딩합니다.
-    """
-    # [0]번 배치의 텍스트만 디코딩
-    text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    return text
+    def __len__(self):
+        return len(self.file_list)
 
-# --- 3. 메인 평가 스크립트 ---
-def main(config_path, checkpoint_path, test_image_path):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"--- DPR-Net V2 Inference Test (on {device}) ---")
-
-    # --- 1. 설정 로드 (YAML) ---
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        print(f"Error: Config file not found at {config_path}")
-        return
+    def __getitem__(self, idx):
+        img_path = self.file_list[idx]
         
+        # 이미지 로드 & 전처리 (0~1 float Tensor로 변환)
+        try:
+            img = Image.open(img_path).convert('RGB')
+            img_np = np.array(img)
+            # (H, W, C) -> (C, H, W)
+            img_tensor = torch.from_numpy(img_np).float().permute(2, 0, 1) / 255.0
+        except Exception as e:
+            print(f"이미지 로드 실패: {img_path} ({e})")
+            # 에러 시 검은 화면 반환
+            img_tensor = torch.zeros((3, 256, 256))
+
+        # (Input Image, Dummy Target, File Name)
+        # Target이 없으므로 Input을 그대로 Target 자리에 넣어서 리턴합니다.
+        return img_tensor, img_tensor, os.path.basename(img_path)
+
+# ----------------------------------------------------------
+# 2. 유틸리티 함수
+# ----------------------------------------------------------
+def tensor2img(tensor):
+    tensor = tensor.cpu().detach().numpy()
+    if tensor.ndim == 4: tensor = tensor[0]
+    tensor = np.transpose(tensor, (1, 2, 0))
+    tensor = np.clip(tensor, 0, 1)
+    return (tensor * 255.0).astype(np.uint8)
+
+# ----------------------------------------------------------
+# 3. 메인 실행 함수
+# ----------------------------------------------------------
+def evaluate_custom_files(config_path, checkpoint_path, target_files):
+    print(f"--- 🔍 Custom File Evaluation ({len(target_files)} images) ---")
+    
+    # 1. 설정 로드
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using Device: {device}")
+
+    # 2. 모델 초기화
+    print("Initializing Model...")
     cfg_model_vet = config['model']['vetnet']
     cfg_model_clip = config['model']['clip']
     cfg_model_llm = config['model']['llm']
-
-    # --- 2. 모델 초기화 (DPR_Net) ---
-    print("Initializing REAL DPR-Net (V2) [LoRA Enabled] Model...")
+    
     model = DPR_Net(
         vetnet_dim=cfg_model_vet['dim'],
         vetnet_num_blocks=cfg_model_vet['num_blocks'],
@@ -72,81 +86,80 @@ def main(config_path, checkpoint_path, test_image_path):
         llm_model_name=cfg_model_llm['model_name'],
         llm_embed_dim=cfg_model_llm['embed_dim']
     ).to(device)
-    
-    model.eval() # (중요) 평가 모드로 설정
-    
-    # --- 3. 체크포인트 로드 ---
-    if not os.path.isfile(checkpoint_path):
-        print(f"[Error] 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
+
+    # 3. 체크포인트 로드
+    print(f"Loading Checkpoint: {os.path.basename(checkpoint_path)}")
+    if not os.path.exists(checkpoint_path):
+        print("Error: 체크포인트 파일이 없습니다!")
         return
-        
-    print(f"Loading checkpoint: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint['model_state_dict']
+    # module. 제거 등 키값 보정
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(new_state_dict, strict=False)
+    model.eval()
+
+    # 4. 데이터 로더 설정 (사용자 지정 리스트 사용)
+    dataset = CustomFileDataset(target_files)
+    # num_workers=0 은 윈도우 필수
+    data_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0) 
+
+    save_dir = "./results/custom_eval"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # (LoRA 모델은 strict=False로 로드하는 것이 안전)
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    print("Checkpoint loaded successfully.")
-
-    # --- 4. 테스트 이미지 로드 ---
-    image_tensor = load_and_prep_image(test_image_path, device)
-    if image_tensor is None:
-        return
-    print(f"Loaded test image: {test_image_path} (Shape: {image_tensor.shape})")
-
-    # --- 5. 모델 추론 (Forward Pass) ---
-    print("\nRunning model inference...")
-    with torch.no_grad():
-        # [수정] 8-bit 추론을 위해 autocast 래핑
-        with autocast(): 
-            outputs = model(image_tensor, mode='eval') # 'eval' 모드 명시
-    print("Inference complete.")
-
-    # --- 6. (A) Control Path 확인 ---
-    print("\n--- (A) Control Path Verification ---")
-    film_signals = outputs.get('film_signals')
-    if film_signals and isinstance(film_signals, dict) and len(film_signals) == 8:
-        print(f"  ✅ PASS: 8개의 FiLM 시그널 딕셔너리가 생성되었습니다.")
-        print(f"     (예: 'latent' 신호 shape: {film_signals['latent'][0].shape})")
-    else:
-        print(f"  ⚠️ FAIL: Control Path 출력이 비정상적입니다. (dpr_net.py 수정 확인)")
-        
-    # --- 7. (B) Text Path 확인 ---
-    print("\n--- (B) Text Path Verification ---")
-    generated_ids = outputs.get('generated_ids')
-    if generated_ids is not None:
-        explanation_text = decode_llm_explanation(generated_ids, model.tokenizer)
-        print(f"  ✅ PASS: LLM이 생성한 '설명 텍스트' (XAI):")
-        print("  " + "="*40)
-        print(f"  {explanation_text}")
-        print("  " + "="*40)
-    else:
-        print(f"  ⚠️ FAIL: Text Path (generated_ids) 출력이 비정상적입니다.")
-        
-    # --- 8. (선택) 복원 이미지 저장 ---
-    restored_img_tensor = outputs['img_restored'][0] 
-    restored_img_pil = T.ToPILImage()(restored_img_tensor.cpu())
+    print("\n--- 🚀 Loop Start (Real-time Log) ---")
     
-    output_path = "restored_output.png"
-    restored_img_pil.save(output_path)
-    print(f"\n✅ 복원된 이미지가 {output_path} 에 저장되었습니다.")
+    with torch.inference_mode():
+        for i, batch in enumerate(data_loader):
+            # 데이터 언패킹 (Input, Dummy, Filename)
+            input_img, _, filename_tuple = batch
+            filename = filename_tuple[0] # 튜플에서 파일명 추출
+            
+            print(f"\n[Image {i+1}/{len(target_files)}] : {filename}")
+            
+            # 1. Data Load Time
+            t0 = time.time()
+            input_img = input_img.to(device)
+            t1 = time.time()
+            # print(f"  > Data Loaded: {t1 - t0:.4f} sec")
 
+            # 2. Inference Time
+            print("  > Inferencing...")
+            with torch.amp.autocast('cuda'): 
+                outputs = model(input_img, mode='eval')
+                restored_img = outputs['img_restored']
+            t2 = time.time()
+            print(f"  > Inference Done: {t2 - t1:.4f} sec")
+
+            # 3. Save Time
+            restored_np = tensor2img(restored_img)
+            input_np = tensor2img(input_img)
+            
+            # 결과 저장: [원본] [복원] 나란히 붙이기
+            save_filename = f"result_{filename}"
+            comparison = np.hstack([input_np, restored_np])
+            
+            cv2.imwrite(os.path.join(save_dir, save_filename), cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
+            t3 = time.time()
+            print(f"  > Saved to {save_dir}/{save_filename}")
+
+    print("\n--- Custom Evaluation Finished ---")
+    print(f"Check images at: {save_dir}")
 
 if __name__ == "__main__":
-    # --- (설정) ---
     CONFIG_PATH = "configs/dpr_config.yaml"
     
-    # [수정] 4 에포크 체크포인트로 변경
-    CHECKPOINT_PATH = r"G:\DPR-Net\checkpoints_lora_en_2\epoch_9_total_0_0903_img_0_0823_text_0_0081_cons_0_0001.pth"
+    # Epoch 5 체크포인트 경로 (본인 경로 확인!)
+    CHECKPOINT_PATH = r"G:\DPR-Net\checkpoints\epoch_5_total_0_0722_img_0_0620_text_0_0096_cons_0_0558.pth"
     
-    # (테스트할 왜곡 이미지 1개 경로 - 예: Rain100H 테스트셋)
-    TEST_IMAGE_PATH = r"G:\DPR-Net\data\SOTS\indoor\hazy\1403_5.png"
-    # --- (설정 끝) ---
-
-    # (경로에 폴더명이 checkpoints_lora가 맞는지 확인하세요)
-    if not os.path.exists(CHECKPOINT_PATH):
-        print(f"[Error] 체크포인트 경로를 확인하세요: {CHECKPOINT_PATH}")
-    # (테스트 이미지가 있는지 확인)
-    elif not os.path.exists(TEST_IMAGE_PATH):
-         print(f"[Error] 테스트 이미지 경로를 확인하세요: {TEST_IMAGE_PATH}")
-    else:
-        main(CONFIG_PATH, CHECKPOINT_PATH, TEST_IMAGE_PATH)
+    # ★ 여기에 테스트하고 싶은 이미지 경로를 리스트로 넣으세요 ★
+    MY_TARGET_FILES = [
+        r"G:\DPR-Net\data\rain100H\test\rain\norain-1.png",
+        r"G:\DPR-Net\data\rain100H\test\rain\norain-2.png",
+        r"G:\DPR-Net\data\rain100H\test\rain\norain-3.png",
+        r"G:\DPR-Net\data\rain100H\test\rain\norain-4.png",
+        r"G:\DPR-Net\data\rain100H\test\rain\norain-5.png"
+    ]
+    
+    evaluate_custom_files(CONFIG_PATH, CHECKPOINT_PATH, MY_TARGET_FILES)

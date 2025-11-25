@@ -109,14 +109,11 @@ def visualize_brain_map(image_path, model_path=None, save_path="brain_heatmap.pn
     print(f"✅ Saved visualization to {save_path}")
     # plt.show() # (옵션) 서버 환경이면 이 줄 주석 처리
 
+# visualize_map.py 맨 아래 실행 부분 수정
 if __name__ == "__main__":
-    # 테스트 이미지 경로
-    TEST_IMAGE = "g:/DPR-Net/data/CSD/Train/Snow/2.tif"
+    TEST_IMAGE = "g:/DPR-Net/data/CSD/Train/Snow/2.tif" # 테스트 이미지
     
-    # 파일이 없으면 더미 생성
-    if not os.path.exists(TEST_IMAGE):
-        print(f"Test image not found at {TEST_IMAGE}. Creating dummy sample.jpg...")
-        TEST_IMAGE = "sample.jpg"
-        Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8)).save(TEST_IMAGE)
-
-    visualize_brain_map(TEST_IMAGE)
+    # 방금 만든 가장 똑똑한 모델 경로
+    MODEL_PATH = r"G:\DPR-Net\checkpoints\epoch_5_total_0_0722_img_0_0620_text_0_0096_cons_0_0558.pth"
+    
+    visualize_brain_map(TEST_IMAGE, model_path=MODEL_PATH)
