@@ -1,4 +1,3 @@
-# 0단계: BLIP-2 Auto-Captioning
 import os
 import json
 import torch
@@ -12,7 +11,7 @@ from transformers import Blip2Processor, Blip2ForConditionalGeneration
 DATA_ROOT = r"G:\DPR-Net\data"
 OUTPUT_JSON = os.path.join(DATA_ROOT, "metadata_captions.json")
 
-# 처리할 데이터셋 폴더 목록 (실제 폴더명과 일치해야 함)
+# 처리할 데이터셋 폴더 목록
 TARGET_FOLDERS = [
     "rain100H",    # Rain Removal
     "lol_dataset", # Low-Light Enhancement
@@ -54,7 +53,7 @@ def generate_caption(processor, model, image_path):
         # 모델 입력 생성
         inputs = processor(images=image, text=PROMPT_TEXT, return_tensors="pt").to(DEVICE, torch.float16)
         
-        # 캡션 생성 (Max tokens: 50 정도로 제한하여 핵심만 추출)
+        # 캡션 생성 (Max tokens: 60 정도로 제한하여 핵심만 추출)
         generated_ids = model.generate(**inputs, max_new_tokens=60)
         caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         
@@ -64,9 +63,17 @@ def generate_caption(processor, model, image_path):
         return None
 
 def get_all_image_paths(root_dir, target_folders):
-    """지정된 폴더 내의 모든 이미지 경로를 수집합니다."""
+    """지정된 폴더 내의 '손상된 이미지(Input)'만 똑똑하게 수집합니다."""
     image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
     image_paths = []
+    
+    # 🚫 제외할 키워드 목록 (정답 이미지/GT 폴더명)
+    # norain: 비 없는 정답
+    # high: 밝은 정답 (LoL)
+    # Gt: Ground Truth (CSD)
+    # clear: 안개 없는 정답 (SOTS)
+    # Mask: 마스크 파일
+    IGNORE_KEYWORDS = ['norain', 'high', 'Gt', 'clear', 'Mask'] 
     
     print(f"🔍 Scanning directories in {root_dir}...")
     
@@ -77,11 +84,16 @@ def get_all_image_paths(root_dir, target_folders):
             continue
             
         for root, dirs, files in os.walk(full_path):
+            # 현재 폴더 경로(root)에 제외 키워드가 하나라도 있으면 통째로 건너뜀
+            # 예: "G:\...\rain100H\train\norain" -> 'norain'이 포함되어 있으므로 Skip
+            if any(keyword in root for keyword in IGNORE_KEYWORDS):
+                continue
+
             for file in files:
                 if file.lower().endswith(image_extensions):
                     image_paths.append(os.path.join(root, file))
                     
-    print(f"   ✅ Found {len(image_paths)} images total.")
+    print(f"   ✅ Found {len(image_paths)} valid input images (filtered GT/Clean images).")
     return image_paths
 
 def main():
@@ -99,7 +111,7 @@ def main():
         except json.JSONDecodeError:
             print("   ⚠️ JSON file is corrupted. Starting from scratch.")
 
-    # 3. 이미지 리스트 수집
+    # 3. 이미지 리스트 수집 (필터링 적용됨)
     image_files = get_all_image_paths(DATA_ROOT, TARGET_FOLDERS)
     
     # 4. 처리 루프
@@ -114,7 +126,7 @@ def main():
         # Windows 경로 호환성을 위해 정규화
         norm_path = os.path.normpath(img_path)
         
-        # 기존 메타데이터에 키가 있는지 확인 (경로 문자열 매칭 주의)
+        # 기존 메타데이터에 키가 있는지 확인
         if norm_path in metadata or img_path in metadata:
             continue
             
