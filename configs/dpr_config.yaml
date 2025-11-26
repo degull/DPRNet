@@ -1,56 +1,79 @@
-# G:\DPR-Net\configs\dpr_config.yaml
-# DPR-Net (V2)의 모든 하이퍼파라미터 및 설정
+# ==============================================================================
+# ⚙️ DPR-Net V2 Configuration File
+# ==============================================================================
 
-# --- 1. 경로 설정 ---
+# [프로젝트 기본 정보]
+project_name: "DPR-Net-V2-PixelLM"
+version: "v2.0_mistral_lora"
+seed: 42  # 재현성을 위한 랜덤 시드 고정
+
+# [경로 설정]
 paths:
-  data_dir: "./data" 
-  checkpoint_dir: "./checkpoints"
+  # 데이터셋 루트 디렉토리
+  root_dir: "G:/DPR-Net/data"
   
-  # [수정] 이어서 학습할 체크포인트 경로 (Windows 경로 역슬래시 \ 대신 / 사용 권장)
-  #resume_checkpoint: "G:/DPR-Net/checkpoints_lora_en/epoch_3_total_0_1085_img_0_0963_text_0_0121_cons_0_0013.pth"
+  # 전처리된 캡션 파일 (preprocessing/preprocess_captions.py 실행 후 생성됨)
+  metadata_file: "G:/DPR-Net/data/metadata_captions.json"
+  
+  # 학습에 사용할 하위 폴더 목록 (필요에 따라 주석 해제/추가)
+  train_folders:
+    - "rain100H/train"     # 비 제거
+    - "lol_dataset/our485" # 저조도 향상
+    - "CSD/train"          # 눈/구름 제거
+    - "SOTS/indoor"        # 안개 제거 (예시)
+  
+  # 모델 체크포인트 저장 경로
+  log_dir: "G:/DPR-Net/logs"
 
-# --- 2. 학습 설정 ---
-train:
-  # (train.py에서 --epochs 인자)
-  epochs: 100
-  # (train.py에서 --batch_size 인자)
-  batch_size: 1
-  # (train.py에서 --patch_size 인자)
-  patch_size: 128
-  # (train.py에서 --learning_rate 인자)
-  learning_rate: 0.00001 # 1e-4
-  # (train.py에서 --save_every 인자)
-  save_every: 5
-
-# --- 3. V2 손실 함수 가중치 ---
-loss:
-  # (train.py에서 --lambda_film 인자)
-  lambda_film: 0.1
-  # (train.py에서 --lambda_consistency 인자)
-  lambda_consistency: 0.01
-
-# --- 4. 모델 아키텍처 설정 ---
-# (dpr_net.py의 DPR_Net.__init__ 인자들)
+# [모델 아키텍처 설정]
 model:
+  # 🧠 Brain: LLM (Mistral-7B)
+  llm_model_id: "mistralai/Mistral-7B-v0.1" 
+  # 만약 로컬에 다운로드 받았다면 로컬 경로로 변경 (예: "G:/models/Mistral-7B-v0.1")
   
-  # 4a. VETNet (Hands) 백본 설정
-  vetnet:
-    dim: 48
-    num_blocks: [4, 6, 6, 8]
-    refinement_blocks: 4
-    heads: [1, 2, 4, 8]
-    ffn_exp: 2.66
-    bias: false
-    ln_type: "WithBias"
-    volterra_rank: 4
+  # 👁️ Eyes: Vision Encoder (CLIP ViT-Large)
+  vision_model_id: "openai/clip-vit-large-patch14"
+  
+  # 🖐️ Hands: Restoration Network (VETNet)
+  vetnet_channels: [64, 128, 256, 512] # U-Net 채널 깊이
 
-  # 4b. CLIP (Eyes) 설정
-  clip:
-    model_name: "ViT-L-14"
-    pretrained: "laion2b_s32b_b82k"
-    embed_dim: 1024 # ViT-L-14의 출력 차원
+  # 텍스트 처리 관련
+  max_length: 128       # 캡션 최대 토큰 길이 (너무 길면 메모리 부족 발생)
+  use_gradient_checkpointing: true # 메모리 절약을 위해 필수 (속도는 약간 느려짐)
 
-  # 4c. LLM (Brain) 설정
-  llm:
-    model_name: "mistralai/Mistral-7B-v0.1"
-    embed_dim: 4096 # Mistral-7B의 hidden 차원
+# [LoRA (Low-Rank Adaptation) 설정]
+# 거대한 LLM 전체를 학습하지 않고, 일부 파라미터만 학습하여 효율성 극대화
+lora:
+  r: 8                  # Rank (클수록 파라미터 많음, 8~16 추천)
+  lora_alpha: 32        # Scaling Factor
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules:       # Mistral의 모든 선형 레이어에 적용
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# [학습 하이퍼파라미터]
+train:
+  batch_size: 2         # GPU 메모리(24GB 기준)에 따라 조절 (Mistral이 커서 작게 시작)
+  accumulate_grad_batches: 8 # 실제 배치 사이즈 효과 = 2 * 8 = 16
+  num_epochs: 10
+  learning_rate: 1e-4   # LLM 학습 시 일반적으로 낮은 LR 사용
+  weight_decay: 0.01
+  
+  # 이미지 크기 설정
+  llm_img_size: 224     # CLIP/LLM 입력용 (고정)
+  train_img_size: 256   # VETNet 학습용 패치 크기 (Random Crop)
+
+  # 데이터 로더 설정
+  num_workers: 4        # 데이터 로딩 병렬 프로세스 수
+  persistent_workers: true
+
+# [시스템 설정]
+system:
+  device: "cuda"        # "cuda" or "cpu"
+  precision: "bf16-mixed" # "16-mixed" (fp16) or "bf16-mixed" (Ampere GPU 이상 추천)
