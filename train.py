@@ -7,19 +7,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 import time
+import datetime
 
-# ------------------------------------------------------------------------------
-# 📊 Metrics Library Import
-# ------------------------------------------------------------------------------
+# Metrics
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-# Custom Modules
+# Modules
 from models.dpr_net_v2 import DPRNetV2
 from data.dataset import DPRDataset
 
-# ==============================================================================
-# ⚙️ Configuration Path
-# ==============================================================================
 CONFIG_PATH = "configs/dpr_config.yaml"
 
 def load_config(path):
@@ -28,16 +24,16 @@ def load_config(path):
     with open(path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
-def save_checkpoint(model, optimizer, epoch, loss, psnr, ssim, save_dir):
-    """
-    파일명에 Loss, PSNR, SSIM을 모두 기록합니다.
-    """
+def log_print(message, log_file):
+    print(message)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(message + "\n")
+
+def save_checkpoint(model, optimizer, epoch, loss, psnr, ssim, save_dir, log_file):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-        
     filename = f"checkpoint_epoch_{epoch:02d}_loss_{loss:.4f}_psnr_{psnr:.2f}_ssim_{ssim:.4f}.pth"
     save_path = os.path.join(save_dir, filename)
-    
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -46,21 +42,26 @@ def save_checkpoint(model, optimizer, epoch, loss, psnr, ssim, save_dir):
         'psnr': psnr,
         'ssim': ssim
     }, save_path)
-    print(f"\n💾 Checkpoint saved: {save_path}")
+    log_print(f"\n💾 Checkpoint saved: {save_path}", log_file)
 
 def main():
-    # --------------------------------------------------------------------------
-    # 1. 초기 설정
-    # --------------------------------------------------------------------------
-    print(f"⚙️ Loading Configuration from {CONFIG_PATH}...")
+    # 1. Setup
     config = load_config(CONFIG_PATH)
-    device = torch.device(config['system']['device'] if torch.cuda.is_available() else "cpu")
-    print(f"   - Device: {device}")
     
-    # --------------------------------------------------------------------------
-    # 2. 데이터셋 & 로더
-    # --------------------------------------------------------------------------
-    print("💿 Initializing Datasets...")
+    log_dir = config['paths']['log_dir']
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    log_file = os.path.join(log_dir, "training_log.txt")
+    
+    start_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_print(f"\n{'='*60}", log_file)
+    log_print(f"🚀 TRAINING STARTED AT: {start_time_str}", log_file)
+    log_print(f"{'='*60}", log_file)
+    
+    device = torch.device(config['system']['device'] if torch.cuda.is_available() else "cpu")
+    
+    # 2. Dataset
+    log_print("💿 Initializing Datasets...", log_file)
     dataset = DPRDataset(
         data_root=config['paths']['root_dir'],
         metadata_file=config['paths']['metadata_file'],
@@ -76,21 +77,19 @@ def main():
         collate_fn=DPRDataset.collate_fn,
         pin_memory=True
     )
-    print(f"   - Total Images: {len(dataset)}")
-    print(f"   - Batch Size: {config['train']['batch_size']}")
+    log_print(f"   - Total Images: {len(dataset)}", log_file)
     
-    # --------------------------------------------------------------------------
-    # 3. 모델 초기화
-    # --------------------------------------------------------------------------
-    print("🏗️ Building DPR-Net V2 Model...")
+    # 3. Model (4-bit)
+    log_print("🏗️ Building DPR-Net V2 Model (4-bit)...", log_file)
     model = DPRNetV2(config).to(device)
     
-    # ⚠️ Windows 호환성을 위해 torch.compile 제거 (안정성 최우선)
-    # print("🚀 Compiling model...") -> 삭제함
-    
-    # --------------------------------------------------------------------------
-    # 4. Optimizer & Metrics
-    # --------------------------------------------------------------------------
+    # ⚡ [핵심 수정] 학습 가능한 파라미터는 무조건 FP32로 캐스팅 (GradScaler 에러 방지)
+    log_print("🔧 Casting trainable parameters to Float32 for AMP stability...", log_file)
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+
+    # 4. Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=float(config['train']['learning_rate']), weight_decay=1e-4)
     
@@ -98,29 +97,22 @@ def main():
     scaler = GradScaler()
     accum_steps = config['train']['accumulate_grad_batches']
     
-    # Metrics (GPU)
+    # Metrics
     metric_psnr = PeakSignalNoiseRatio().to(device)
     metric_ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     
-    # --------------------------------------------------------------------------
-    # 6. 학습 루프
-    # --------------------------------------------------------------------------
-    print("\n🚀 STARTING TRAINING (Stable Mode) 🚀")
-    print("="*60)
-    
+    # 6. Training Loop
     num_epochs = config['train']['num_epochs']
-    log_interval = 100 
+    log_interval = 50 
     
     for epoch in range(1, num_epochs + 1):
         model.train()
-        
         epoch_loss = 0.0
         epoch_psnr = 0.0
         epoch_ssim = 0.0
+        t0 = time.time()
         
-        start_time = time.time()
-        
-        print(f"\n[Epoch {epoch}/{num_epochs}] Started...")
+        log_print(f"\n[Epoch {epoch}/{num_epochs}] Started...", log_file)
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
         
         for step, batch in enumerate(progress_bar):
@@ -130,7 +122,6 @@ def main():
             vet_input = batch['vet_input'].to(device)
             vet_target = batch['vet_target'].to(device)
             
-            # Forward Pass
             with autocast():
                 model_input = {
                     'pixel_values': pixel_values,
@@ -140,66 +131,56 @@ def main():
                 }
                 
                 restored_images = model(model_input)
+                restored_clamped = torch.clamp(restored_images, 0.0, 1.0)
                 
-                # Loss 계산
                 loss = criterion(restored_images, vet_target)
                 loss_scaled = loss / accum_steps
 
-            # Backward Pass
             scaler.scale(loss_scaled).backward()
             
-            # Optimization
             if (step + 1) % accum_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Metrics (no_grad)
             with torch.no_grad():
-                restored_clamped = torch.clamp(restored_images, 0.0, 1.0)
                 current_loss = loss.item()
-                
                 batch_psnr = metric_psnr(restored_clamped, vet_target).item()
                 batch_ssim = metric_ssim(restored_clamped, vet_target).item()
             
-            # 누적
             epoch_loss += current_loss
             epoch_psnr += batch_psnr
             epoch_ssim += batch_ssim
             
-            # Progress Bar
             progress_bar.set_postfix({
                 'loss': f"{current_loss:.4f}", 
-                'psnr': f"{batch_psnr:.2f}dB"
+                'psnr': f"{batch_psnr:.2f}dB",
+                'ssim': f"{batch_ssim:.4f}"
             })
             
-            # 터미널 로그
             if (step + 1) % log_interval == 0:
-                print(f"   [Step {step+1}/{len(train_loader)}] "
-                      f"Loss: {current_loss:.4f} | PSNR: {batch_psnr:.2f} | SSIM: {batch_ssim:.4f}")
+                msg = f"   [Step {step+1}/{len(train_loader)}] Loss: {current_loss:.4f} | PSNR: {batch_psnr:.2f}dB | SSIM: {batch_ssim:.4f}"
+                print(msg) 
         
-        # Epoch 결과 집계
         avg_loss = epoch_loss / len(train_loader)
         avg_psnr = epoch_psnr / len(train_loader)
         avg_ssim = epoch_ssim / len(train_loader)
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.time() - t0
         
-        print(f"\n📊 Epoch {epoch} Done.")
-        print(f"   Time: {elapsed_time:.2f}s")
-        print(f"   Loss: {avg_loss:.5f}")
-        print(f"   PSNR: {avg_psnr:.2f} dB")
-        print(f"   SSIM: {avg_ssim:.4f}")
-        
-        # 체크포인트 저장
-        save_checkpoint(model, optimizer, epoch, avg_loss, avg_psnr, avg_ssim, config['paths']['log_dir'])
-        
-        # Metric 초기화
+        result_msg = (
+            f"\n📊 Epoch {epoch} Done.\n"
+            f"   Time: {elapsed_time:.2f}s\n"
+            f"   Loss: {avg_loss:.5f}\n"
+            f"   PSNR: {avg_psnr:.2f} dB\n"
+            f"   SSIM: {avg_ssim:.4f}"
+        )
+        log_print(result_msg, log_file)
+        save_checkpoint(model, optimizer, epoch, avg_loss, avg_psnr, avg_ssim, config['paths']['log_dir'], log_file)
         metric_psnr.reset()
         metric_ssim.reset()
-        
-        print("-" * 60)
+        log_print("-" * 60, log_file)
     
-    print("🏁 Training Finished Successfully!")
+    log_print("🏁 Training Finished Successfully!", log_file)
 
 if __name__ == "__main__":
     main()
