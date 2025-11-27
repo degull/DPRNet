@@ -91,7 +91,7 @@ class MistralLLM(nn.Module):
         
         # 전체 Hidden State 반환
         # (Slicing은 Pixel Decoder 혹은 Main Model에서 수행)
-        return outputs.last_hidden_state
+        return outputs.hidden_states[-1]
 
     # ==========================================================================
     # 🗣️ Optional: Text Generation Mode (for Debugging/Captioning)

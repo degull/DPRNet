@@ -2,22 +2,19 @@ import os
 import sys
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast # ⚡ 핵심 추가: 혼합 정밀도 지원
 
-# 프로젝트 루트 경로 추가 (모듈 import 문제 방지)
+# 프로젝트 루트 경로 추가
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models.dpr_net_v2 import DPRNetV2
 
 # ==============================================================================
 # 🛠️ Mock Configuration (테스트용 가짜 설정)
-# 실제 config.yaml을 읽지 않고, 테스트에 필요한 최소 설정만 정의합니다.
 # ==============================================================================
 class TestConfig:
     def __init__(self):
         self.model = type('obj', (object,), {
-            # 실제 모델 로드가 부담스럽다면 가벼운 모델로 교체해서 테스트 가능
-            # "mistralai/Mistral-7B-v0.1" (실제) <-> "gpt2" (테스트용 가벼운 모델 - 구조 달라서 에러날 수 있음)
-            # 여기서는 실제 통합 테스트를 위해 원래 ID 사용
             'llm_model_id': "mistralai/Mistral-7B-v0.1", 
             'vision_model_id': "openai/clip-vit-large-patch14",
             'vetnet_channels': [64, 128, 256, 512]
@@ -36,32 +33,34 @@ def test_dpr_net():
     
     try:
         model = DPRNetV2(config).to(device)
-        model.eval() # 평가 모드 (Dropout 등 비활성화)
+        model.eval()
+        
+        # ⚠️ 중요: Mistral이 FP16이므로, Projector 등 새로 만든 레이어도 FP16으로 맞춰주는 것이 안전함
+        # (학습 시에는 autocast가 해주지만, 명시적 변환이 더 확실함)
+        model.brain.projector.half() 
+        
         print("   ✅ Model initialized successfully!")
     except Exception as e:
         print(f"   ❌ Model Initialization Failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
-    # 3. 더미 데이터 생성 (Batch Size = 2)
+    # 3. 더미 데이터 생성
     print("\n📦 [Data] Generating Dummy Batch...")
     batch_size = 2
     text_len = 128
-    vision_token_len = 257 # CLS + 256 Patches
+    vision_token_len = 257 
     
-    # (A) CLIP Input: [B, 3, 224, 224]
+    # 입력 데이터는 기본적으로 FP32로 생성되지만, autocast 안에서 자동으로 처리됨
     pixel_values = torch.randn(batch_size, 3, 224, 224).to(device)
-    
-    # (B) Mistral Input IDs: [B, 128] (Random Integer Tokens)
     input_ids = torch.randint(0, 32000, (batch_size, text_len)).to(device)
     
-    # (C) Attention Mask: [B, 257 + 128]
-    # Vision(1) + Text(1) 형태
     vision_mask = torch.ones((batch_size, vision_token_len)).to(device)
     text_mask = torch.ones((batch_size, text_len)).to(device)
     attention_mask = torch.cat([vision_mask, text_mask], dim=1).long()
     
-    # (D) VETNet Input (High-Res): [B, 3, 256, 256]
-    # 실제 학습 시엔 Crop된 사이즈가 들어옴
+    # VETNet 입력
     h, w = 256, 256
     high_res_images = torch.randn(batch_size, 3, h, w).to(device)
     
@@ -81,13 +80,13 @@ def test_dpr_net():
     # 4. Forward Pass (복원 모드 테스트)
     print("\n🔄 [Forward] Running Restoration Mode...")
     try:
-        with torch.no_grad(): # 메모리 절약
+        # ⚡ 핵심 수정: autocast 사용 (FP32 입력을 FP16 모델에 맞게 자동 변환)
+        with torch.no_grad(), autocast(): 
             output = model(batch)
             
         print("   ✅ Forward Pass Successful!")
         print(f"   - Output Shape: {output.shape}")
         
-        # 검증: 출력 크기가 입력(High-Res)과 같은지
         if output.shape == high_res_images.shape:
              print("   ✨ Shape Check Passed: Output matches Input Resolution.")
         else:
@@ -101,11 +100,18 @@ def test_dpr_net():
     # 5. Chat Mode Test (설명 모드 테스트)
     print("\n💬 [Chat] Running Caption Generation Mode...")
     try:
-        captions = model.chat_about_image(batch, max_new_tokens=20)
+        # Chat 모드도 autocast 필요
+        with torch.no_grad(), autocast():
+            # generate 함수 호출 시 attention_mask를 명시적으로 전달해야 경고가 사라짐
+            # 하지만 chat_about_image 함수 내부를 수정하기보다는 여기서 예외처리만 확인
+            captions = model.chat_about_image(batch, max_new_tokens=20)
+            
         print("   ✅ Chat Generation Successful!")
         print(f"   - Generated Captions (Random Init): {captions}")
     except Exception as e:
         print(f"   ❌ Chat Mode Failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     print("\n🏁 [End] Test Complete.")
 

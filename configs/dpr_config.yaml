@@ -59,7 +59,7 @@ lora:
 
 # [학습 하이퍼파라미터]
 train:
-  batch_size: 2         # GPU 메모리(24GB 기준)에 따라 조절 (Mistral이 커서 작게 시작)
+  batch_size: 1         # GPU 메모리(24GB 기준)에 따라 조절 (Mistral이 커서 작게 시작)
   accumulate_grad_batches: 8 # 실제 배치 사이즈 효과 = 2 * 8 = 16
   num_epochs: 10
   learning_rate: 1e-4   # LLM 학습 시 일반적으로 낮은 LR 사용
@@ -70,8 +70,8 @@ train:
   train_img_size: 256   # VETNet 학습용 패치 크기 (Random Crop)
 
   # 데이터 로더 설정
-  num_workers: 4        # 데이터 로딩 병렬 프로세스 수
-  persistent_workers: true
+  num_workers: 0        # 데이터 로딩 병렬 프로세스 수
+  persistent_workers: false
 
 # [시스템 설정]
 system:
