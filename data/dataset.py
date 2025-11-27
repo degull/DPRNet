@@ -31,7 +31,8 @@ class DPRDataset(Dataset):
         
         # VETNet용 전처리 (학습을 위해 256x256 Resize로 통일)
         self.transform_vet = transforms.Compose([
-            transforms.Resize((256, 256)), 
+            #transforms.Resize(256),
+            transforms.RandomCrop(128),
             transforms.ToTensor() 
         ])
 

@@ -12,12 +12,6 @@ from peft import get_peft_model, LoraConfig, TaskType
 
 class MistralLLM(nn.Module):
     def __init__(self, model_id="mistralai/Mistral-7B-v0.1", vision_hidden_size=1024, llm_hidden_size=4096):
-        """
-        Args:
-            model_id: Mistral 모델 ID
-            vision_hidden_size: CLIP 출력 차원 (기본 1024)
-            llm_hidden_size: Mistral 입력 차원 (기본 4096)
-        """
         super().__init__()
         print(f"🧠 Loading Mistral LLM: {model_id}...")
         
@@ -53,15 +47,6 @@ class MistralLLM(nn.Module):
         self.llm.print_trainable_parameters() # 학습 가능한 파라미터 비율 출력
 
     def forward(self, image_embeds, input_ids, attention_mask):
-        """
-        Args:
-            image_embeds: [Batch, 257, 1024] (from CLIP)
-            input_ids: [Batch, Text_Len] (Text Tokens)
-            attention_mask: [Batch, 257 + Text_Len] (Combined Mask)
-            
-        Returns:
-            last_hidden_state: [Batch, 257 + Text_Len, 4096]
-        """
         # 1. Vision Embedding Projection
         # [B, 257, 1024] -> [B, 257, 4096]
         image_embeds_proj = self.projector(image_embeds)
@@ -115,4 +100,97 @@ class MistralLLM(nn.Module):
         )
         
         # 생성된 토큰을 텍스트로 디코딩
+        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+# 4bit 수정
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+
+# ==============================================================================
+# 🧠 The Brain: Mistral-7B LLM (4-bit Quantized for Speed)
+# ==============================================================================
+
+class MistralLLM(nn.Module):
+    def __init__(self, model_id="mistralai/Mistral-7B-v0.1", vision_hidden_size=1024, llm_hidden_size=4096):
+        super().__init__()
+        print(f"🧠 Loading Mistral LLM (4-bit): {model_id}...")
+        
+        # 1. Tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer.pad_token = self.tokenizer.eos_token 
+        
+        # ⚡ [핵심] 4-bit Quantization 설정 (메모리 1/4 절약)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+        # 2. Load Model in 4-bit
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config, # 4비트 설정 적용
+            device_map="auto"
+        )
+        
+        # 학습 안정화를 위한 전처리 (Gradient Checkpointing 등 자동 설정)
+        self.llm = prepare_model_for_kbit_training(self.llm)
+
+        # 3. Projector (Adapter)
+        self.projector = nn.Linear(vision_hidden_size, llm_hidden_size)
+        # Projector는 학습해야 하므로 FP16으로 설정
+        self.projector.half() 
+        
+        # 4. Apply LoRA
+        print("🚀 Applying LoRA (Low-Rank Adaptation)...")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False, 
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
+        self.llm = get_peft_model(self.llm, peft_config)
+        self.llm.print_trainable_parameters()
+
+    def forward(self, image_embeds, input_ids, attention_mask):
+        # 1. Vision Projection (FP16)
+        image_embeds_proj = self.projector(image_embeds)
+        
+        # 2. Text Embedding
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+        
+        # 3. Concatenation
+        inputs_embeds = torch.cat([image_embeds_proj, text_embeds], dim=1)
+        
+        if inputs_embeds.requires_grad:
+            inputs_embeds.retain_grad()
+        
+        # 4. Forward Pass
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        
+        # 5. Return Last Hidden State
+        # 튜플의 마지막 요소 반환
+        return outputs.hidden_states[-1]
+
+    def generate_caption(self, image_embeds, input_ids, max_new_tokens=50):
+        image_embeds_proj = self.projector(image_embeds)
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+        inputs_embeds = torch.cat([image_embeds_proj, text_embeds], dim=1)
+        
+        outputs = self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.tokenizer.pad_token_id,
+            do_sample=True, 
+            temperature=0.7
+        )
         return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
