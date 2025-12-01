@@ -1,4 +1,4 @@
-# train.py
+""" # train.py
 # 원본
 import os
 import yaml
@@ -189,12 +189,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() """
 
-
-# 이어서 학습
-# train.py
-""" import os
+# train.py  (Resume from latest checkpoint)
+import os
 import yaml
 import time
 import datetime
@@ -259,7 +257,6 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     log_file = os.path.join(save_dir, "training_log.txt")
 
-    # 로그 이어쓰기 — 기존 로그 아래에 계속 기록됨
     log_print("\n" + "=" * 60, log_file)
     log_print(f"🚀 TRAINING STARTED AT: {datetime.datetime.now()}", log_file)
     log_print("=" * 60, log_file)
@@ -285,6 +282,7 @@ def main():
 
     # Model
     model = DPRNetV2(config).to(device)
+
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -301,25 +299,26 @@ def main():
     metric_psnr = PeakSignalNoiseRatio().to(device)
     metric_ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
-    # ==============================
-    # 🔥 Resume from latest checkpoint
-    # ==============================
+    # Resume
     ckpt_path, last_epoch = find_last_checkpoint(save_dir)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+        # ⬇️ 핵심 수정 — strict=False 로 로드하여 NF4 quant state 무시
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = last_epoch + 1
-        log_print(f"🔁 Resuming from: {ckpt_path} (start at epoch {start_epoch})", log_file)
+
+        log_print(f"🔁 Resuming from: {ckpt_path}", log_file)
+        log_print(f"   ➤ Ignored unexpected keys: {len(unexpected)}", log_file)
     else:
         start_epoch = 1
         log_print("📌 No previous checkpoint found — starting from epoch 1", log_file)
 
     num_epochs = config["train"]["num_epochs"]
 
-    # ==============================
     # TRAIN LOOP
-    # ==============================
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         epoch_loss = 0
@@ -364,6 +363,7 @@ def main():
             with torch.no_grad():
                 batch_psnr = metric_psnr(restored_clamped, vet_target).item()
                 batch_ssim = metric_ssim(restored_clamped, vet_target).item()
+
                 epoch_loss += loss.item()
                 epoch_psnr += batch_psnr
                 epoch_ssim += batch_ssim
@@ -374,14 +374,14 @@ def main():
                 ssim=f"{batch_ssim:.4f}",
             )
 
-            if step % 100 == 0:
-                msg = (
+            if (step % 100) == 0:
+                iter_msg = (
                     f"[Epoch {epoch}] Step {step}/{len(train_loader)} | "
                     f"Loss: {loss.item():.4f} | PSNR: {batch_psnr:.2f} | SSIM: {batch_ssim:.4f}"
                 )
-                progress_bar.write(msg)
+                progress_bar.write(iter_msg)
                 with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(msg + "\n")
+                    f.write(iter_msg + "\n")
 
         epoch_loss /= len(train_loader)
         epoch_psnr /= len(train_loader)
@@ -401,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- """
