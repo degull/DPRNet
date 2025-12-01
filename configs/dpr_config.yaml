@@ -23,7 +23,8 @@ paths:
     - "SOTS/indoor"        # 안개 제거 (예시)
   
   # 모델 체크포인트 저장 경로
-  log_dir: "G:/DPR-Net/logs"
+  #log_dir: "G:/DPR-Net/logs"
+  log_dir: "G:/DPR-Net/checkpoint"
 
 # [모델 아키텍처 설정]
 model:
@@ -62,12 +63,12 @@ train:
   batch_size: 1         # GPU 메모리(24GB 기준)에 따라 조절 (Mistral이 커서 작게 시작)
   accumulate_grad_batches: 16 # 실제 배치 사이즈 효과 = 2 * 8 = 16
   num_epochs: 10
-  learning_rate: 1e-4   # LLM 학습 시 일반적으로 낮은 LR 사용
+  learning_rate: 1e-5   # LLM 학습 시 일반적으로 낮은 LR 사용
   weight_decay: 0.01
   
   # 이미지 크기 설정
   llm_img_size: 224     # CLIP/LLM 입력용 (고정)
-  train_img_size: 256   # VETNet 학습용 패치 크기 (Random Crop)
+  train_img_size: 128   # VETNet 학습용 패치 크기 (Random Crop)
 
   # 데이터 로더 설정
   num_workers: 0        # 데이터 로딩 병렬 프로세스 수
